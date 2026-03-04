@@ -306,15 +306,11 @@ void menuHook(const char* menuidstr, HMENU menu, int flag) {
 }
 
 HMENU addMenu(HMENU parent, const char* label) {
+    // NOTE: Must use InsertMenu + MF_POPUP on macOS/SWELL (not InsertMenuItem + MIIM_SUBMENU)
+    HMENU sub = CreatePopupMenu();
     int pos = GetMenuItemCount(parent);
-    MENUITEMINFO mii = {0};
-    mii.cbSize = sizeof(mii);
-    mii.fMask = MIIM_TYPE | MIIM_SUBMENU;
-    mii.fType = MFT_STRING;
-    mii.dwTypeData = (char*)label;
-    mii.hSubMenu = CreatePopupMenu();
-    InsertMenuItem(parent, pos, TRUE, &mii);
-    return mii.hSubMenu;
+    InsertMenu(parent, pos, MF_BYPOSITION | MF_POPUP | MF_STRING, (UINT_PTR)sub, label);
+    return sub;
 }
 
 void addAction(HMENU menu, const char* label, const char* command) {
@@ -439,6 +435,45 @@ typedef struct {
 | `MF_CHECKED` | `0x00000008` | Set checkmark |
 | `MF_UNCHECKED` | `0x00000000` | Remove checkmark |
 | `MF_GRAYED` | `0x00000001` | Gray out the item |
+
+### InsertMenu (SWELL_InsertMenu) — Simpler Menu API
+
+```c
+void SWELL_InsertMenu(HMENU menu, int pos, unsigned int flag, UINT_PTR idx, const char *str);
+// Aliased as InsertMenu via SWELL defines
+```
+
+This is the simpler Win32 `InsertMenu` API. Key flags:
+
+| Flag | Value | Meaning |
+|------|-------|---------|
+| `MF_STRING` | `0x0000` | Item is a text string |
+| `MF_POPUP` | `0x0010` | Item is a submenu — `idx` is the HMENU cast to UINT_PTR |
+| `MF_BYPOSITION` | `0x0400` | `pos` is a zero-based index |
+| `MF_SEPARATOR` | `0x0800` | Separator item |
+
+### CRITICAL: Adding Submenus on macOS/SWELL
+
+**DO NOT use `InsertMenuItem` with `MIIM_SUBMENU` / `hSubMenu` for submenus on macOS.**
+The menu item will appear but the submenu **will not expand**. This is a known SWELL behavior.
+
+**USE `InsertMenu` with `MF_POPUP` instead** — this is what WDL's own `InsertSubMenu` helper does (`WDL/win32_helpers.h`):
+
+```c
+// C/C++ — WDL pattern
+HMENU sub = CreatePopupMenu();
+// ... populate sub with items ...
+InsertMenu(parent, pos, MF_BYPOSITION | MF_POPUP | MF_STRING, (UINT_PTR)sub, "Submenu Label");
+```
+
+```zig
+// Zig equivalent
+var sub = Menu.createMenu();
+// ... populate sub with items ...
+swell.InsertMenu(parent, pos, MF_BYPOSITION | MF_POPUP | MF_STRING, @intFromPtr(sub.handle), label);
+```
+
+**`InsertMenuItem` is fine for regular items** (actions, separators) — only submenus require `InsertMenu` + `MF_POPUP`.
 
 ### InsertMenuItem Position Parameter
 
@@ -714,6 +749,7 @@ These strings are used with `GetMediaItemInfo_Value` / `SetMediaItemInfo_Value` 
 3. **flag=1 is for dynamic state** — set checkmarks, enable/disable items here.
 4. **Don't retain submenu handles** — after inserting a submenu into a parent, REAPER owns it. Don't store the handle for later use.
 5. **Call AddExtensionsMainMenu()** before your hook will be triggered for `"Main extensions"`.
+6. **Use `InsertMenu` + `MF_POPUP` for submenus on macOS** — `InsertMenuItem` with `MIIM_SUBMENU`/`hSubMenu` will create an item that doesn't expand. See [SWELL section](#critical-adding-submenus-on-macosswell) for the correct pattern.
 
 ### Action ID Persistence
 
