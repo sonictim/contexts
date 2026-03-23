@@ -112,11 +112,30 @@ const fields = @typeInfo(MyStruct).@"struct".fields;
 
 Union tag names in `@typeInfo` are now lowercase and since `struct`, `enum`, `union`, `fn` etc. are keywords, they require the `@"..."` quoted identifier syntax.
 
-### 1.5 No Async/Await
+### 1.5 Async/Await Restored in 0.16
 
-Async/await was **removed** from Zig after 0.11. Do not generate `async`, `await`, `suspend`, `resume`, or `nosuspend` code. Use `std.Thread` for concurrency.
+Async/await was removed after 0.11 but has been **restored in 0.16** with a new implementation backed by `std.Io`. The new async works with the threaded I/O system — `io.async()` dispatches work to the thread pool, and you can `.await()` the result.
 
-### 1.6 `std.os` → `std.posix`
+```zig
+// Fire-and-forget async (dispatches to thread pool)
+const future = io.async(myFunction, .{arg1, arg2});
+const result = future.await();
+```
+
+**Important**: The old 0.11-era `suspend`/`resume`/`nosuspend` frame-based async is gone. The new async is thread-pool-based via `std.Io`.
+
+### 1.6 `std.time`, `std.fs`, and Other APIs Moved to `std.Io`
+
+Many standalone standard library functions **no longer exist** in 0.16. They have been absorbed into the `std.Io` interface and require an `io` handle.
+
+| Old (BROKEN in 0.16) | New |
+|---|---|
+| `std.time.sleep(ns)` | `io.sleep(std.Io.Duration.fromSeconds(n), .awake)` |
+| `std.fs.cwd()` | `std.Io.Dir.cwd()` |
+| `std.io.getStdOut()` | `std.Io.File.stdout().writer(io, &.{})` |
+| `std.fs.openFileAbsolute(path)` | `std.Io.Dir.cwd().openFile(io, path, .{})` |
+
+### 1.7 `std.os` → `std.posix`
 
 `std.os` was renamed to `std.posix` in 0.12.
 
@@ -871,6 +890,24 @@ const hash = std.hash.Crc32.hash(data);
 
 This section details the new I/O system. **This is the single biggest change in modern Zig.**
 
+### `std.process.Init` ("Juicy Main")
+
+The new `main()` signature receives an `init` struct that provides everything a program needs:
+
+```zig
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;       // threaded I/O handle (thread pool, file I/O, sleep, random)
+    const gpa = init.gpa;     // thread-safe general purpose allocator
+    const arena = init.arena;  // arena allocator
+}
+```
+
+- `init.io` — A `std.Io` backed by a thread pool (CPU count - 1 threads). Provides file I/O, sleep, randomness, async dispatch.
+- `init.gpa` — Thread-safe `std.mem.Allocator`. Prefer this over creating your own `GeneralPurposeAllocator` or using `page_allocator`.
+- `init.arena` — Arena allocator for allocations that live until program exit.
+
+**Note**: `pub fn main() void` and `pub fn main() !void` still work for simple programs that only use `std.debug.print()`.
+
 ### Getting the `io` Handle
 
 **In `main()`:**
@@ -1097,14 +1134,17 @@ fn threadFn() !void {
 ### DO NOT generate:
 1. **`std.io.getStdOut()`** → Use `std.Io.File.stdout().writer(io, &.{})` + `.interface`
 2. **`std.fs.cwd()`** → Use `std.Io.Dir.cwd()`
-3. **`@intCast(T, value)`** → Use `const x: T = @intCast(value)` (single arg, type inferred)
-4. **`@enumToInt()`** → Use `@intFromEnum()`
-5. **`@typeInfo(T).Struct`** → Use `@typeInfo(T).@"struct"`
-6. **`async`/`await`/`suspend`/`resume`** → Removed. Use `std.Thread`
-7. **`std.mem.split()`** → Use `std.mem.splitSequence()` or `std.mem.splitScalar()`
-8. **`std.ArrayList(T).init(alloc)`** → Use `std.ArrayList(T) = .empty`, pass allocator per-operation
-9. **`std.os.`** → Use `std.posix.`
-10. **`std.rand.`** → Use `std.Random.`
+3. **`std.time.sleep()`** → Use `io.sleep(std.Io.Duration.fromSeconds(n), .awake)`
+4. **`@intCast(T, value)`** → Use `const x: T = @intCast(value)` (single arg, type inferred)
+5. **`@enumToInt()`** → Use `@intFromEnum()`
+6. **`@typeInfo(T).Struct`** → Use `@typeInfo(T).@"struct"`
+7. **`suspend`/`resume`/`nosuspend`** → Old frame-based async is gone. Use `io.async()` / `.await()` for new thread-pool async
+8. **`std.mem.split()`** → Use `std.mem.splitSequence()` or `std.mem.splitScalar()`
+9. **`std.ArrayList(T).init(alloc)`** → Use `std.ArrayList(T) = .empty`, pass allocator per-operation
+10. **`std.os.`** → Use `std.posix.`
+11. **`std.rand.`** → Use `std.Random.`
+12. **`std.heap.page_allocator` in main** → Prefer `init.gpa` from `std.process.Init`
+13. **Creating your own `GeneralPurposeAllocator`** → Prefer `init.gpa` from `std.process.Init`
 
 ### DO generate:
 1. `std.debug.print()` for quick output — it still works with no I/O setup
@@ -1115,6 +1155,7 @@ fn threadFn() !void {
 6. Multi-object `for` loops for parallel iteration
 7. `.{}` anonymous struct/tuple syntax
 8. `0..` open-ended ranges in for loops
+9. `io.async(fn, .{args})` / `.await()` for thread-pool-based async (restored in 0.16)
 
 ### Data-Oriented Design
 
