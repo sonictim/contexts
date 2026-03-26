@@ -1,8 +1,8 @@
 # Zig 0.16 Language Context for LLMs
 
-> **Purpose**: This document provides comprehensive, up-to-date context on the Zig programming language as of **Zig 0.16.0-dev** (February 2026). Most LLMs were trained on Zig 0.11–0.13 era code, which is now significantly outdated. Use this document to avoid generating broken or deprecated Zig code.
+> **Purpose**: This document provides comprehensive, up-to-date context on the Zig programming language as of **Zig 0.16.0-dev** (March 2026). Most LLMs were trained on Zig 0.11–0.13 era code, which is now significantly outdated. Use this document to avoid generating broken or deprecated Zig code.
 
-> **Sources**: Ziglings exercises (targeting 0.16.0-dev.2471), Zig source repository on Codeberg, ziglang.org, zig.guide.
+> **Sources**: Ziglings exercises (targeting 0.16.0-dev.2915), Zig source repository on Codeberg, ziglang.org, zig.guide. Last updated: 2026-03-26.
 
 ---
 
@@ -29,7 +29,7 @@
 19. [The New std.Io Interface (0.15/0.16)](#19-the-new-stdio-interface-01516)
 20. [Build System](#20-build-system)
 21. [C Interoperability](#21-c-interoperability)
-22. [Threading](#22-threading)
+22. [Threading and Structured Concurrency](#22-threading-and-structured-concurrency)
 23. [Common Pitfalls for LLMs](#23-common-pitfalls-for-llms)
 24. [How to Update This Document](#24-how-to-update-this-document)
 
@@ -114,15 +114,41 @@ Union tag names in `@typeInfo` are now lowercase and since `struct`, `enum`, `un
 
 ### 1.5 Async/Await Restored in 0.16
 
-Async/await was removed after 0.11 but has been **restored in 0.16** with a new implementation backed by `std.Io`. The new async works with the threaded I/O system — `io.async()` dispatches work to the thread pool, and you can `.await()` the result.
+Async/await was removed after 0.11 and the keywords were removed in 0.15, but **async/await has been restored in 0.16** with a completely new implementation backed by `std.Io`. This is NOT the old 0.11-era frame-based `suspend`/`resume`/`nosuspend` system — those are still gone.
+
+The new async works with the `std.Io` interface, which is vtable-based and dispatches to platform-specific backends (Grand Central Dispatch on Apple, io_uring on Linux, kqueue on BSDs).
+
+**Two tiers of concurrency:**
 
 ```zig
-// Fire-and-forget async (dispatches to thread pool)
-const future = io.async(myFunction, .{arg1, arg2});
-const result = future.await();
+// io.async — dispatch work, may run inline (eager) or on fiber/thread pool
+var future = io.async(myFunction, .{ arg1, arg2 });
+const result = future.await(io);
+
+// io.concurrent — MUST use actual parallelism (guaranteed thread pool thread)
+// Can fail with ConcurrencyUnavailable
+var future2 = try io.concurrent(myFunction, .{ arg1, arg2 });
+const result2 = future2.await(io);
 ```
 
-**Important**: The old 0.11-era `suspend`/`resume`/`nosuspend` frame-based async is gone. The new async is thread-pool-based via `std.Io`.
+**Key difference:** `io.async()` may execute the function eagerly/inline (returns `null` future if result is already computed). `io.concurrent()` guarantees a separate unit of concurrency but can fail if the thread pool is exhausted. Use `concurrent` for CPU-bound work where you need true parallelism.
+
+**Cancellation:**
+```zig
+// Cancel a future (blocks until task finishes, task gets error.Canceled)
+const result = future.cancel(io);
+
+// Check for cancellation in long-running CPU work
+try io.checkCancel();
+
+// Block cancellation in a critical section
+const prev = io.swapCancelProtection(.blocked);
+defer _ = io.swapCancelProtection(prev);
+```
+
+**See Section 22 for full structured concurrency details (Group, Select, Batch).**
+
+**DO NOT generate:** `suspend`, `resume`, `nosuspend`, `@frameSize` — the old 0.11-era frame-based async primitives are gone. The new async/await in 0.16 is thread-pool-based via `std.Io`.
 
 ### 1.6 `std.time`, `std.fs`, and Other APIs Moved to `std.Io`
 
@@ -131,15 +157,23 @@ Many standalone standard library functions **no longer exist** in 0.16. They hav
 | Old (BROKEN in 0.16) | New |
 |---|---|
 | `std.time.sleep(ns)` | `io.sleep(std.Io.Duration.fromSeconds(n), .awake)` |
+| `std.time.timestamp()` | `std.Io.Timestamp.now(io, .real)` |
+| `std.time.nanoTimestamp()` | `std.Io.Timestamp.now(io, .awake).toNanoseconds()` |
+| `std.time.Timer` | `std.Io.Timestamp.now(io, .awake)` + `.untilNow()` |
 | `std.fs.cwd()` | `std.Io.Dir.cwd()` |
-| `std.io.getStdOut()` | `std.Io.File.stdout().writer(io, &.{})` |
 | `std.fs.openFileAbsolute(path)` | `std.Io.Dir.cwd().openFile(io, path, .{})` |
+| `std.io.getStdOut()` | `std.Io.File.stdout().writer(io, &.{})` |
+| `std.io.getStdErr()` | `std.Io.File.stderr().writer(io, &.{})` |
+| `std.io.getStdIn()` | `std.Io.File.stdin().reader(io, &.{})` |
+| `std.io.BufferedWriter` | Built into `std.Io.Writer` (no separate type) |
+| `std.io.CountingWriter` | `std.Io.Writer.Discarding` (has a count) |
+| `std.crypto.random` | `io.random(buffer)` or `try io.randomSecure(buffer)` |
 
 ### 1.7 `std.os` → `std.posix`
 
 `std.os` was renamed to `std.posix` in 0.12.
 
-### 1.7 `std.mem.split`/`tokenize` Renamed
+### 1.8 `std.mem.split`/`tokenize` Renamed
 
 | Old (BROKEN) | New |
 |---|---|
@@ -148,7 +182,7 @@ Many standalone standard library functions **no longer exist** in 0.16. They hav
 | (new) | `std.mem.splitScalar(u8, str, char)` — for single-char delimiter |
 | (new) | `std.mem.tokenizeScalar(u8, str, char)` — for single-char delimiter |
 
-### 1.8 `@fieldParentPtr` Change
+### 1.9 `@fieldParentPtr` Change
 
 **Old (BROKEN):**
 ```zig
@@ -162,7 +196,7 @@ const self: *ZiglingStep = @alignCast(@fieldParentPtr("step", step));
 
 Type is inferred from the result; `@alignCast` is often needed alongside.
 
-### 1.9 ArrayList API Change
+### 1.10 ArrayList API Change
 
 **Old (BROKEN):**
 ```zig
@@ -179,6 +213,51 @@ try list.append(allocator, 42);
 ```
 
 The allocator is now passed to each operation rather than stored in the struct. Initialize with `.empty` instead of `.init(allocator)`.
+
+### 1.11 `GeneralPurposeAllocator` → `DebugAllocator` (0.16, March 2026)
+
+**Old (BROKEN):**
+```zig
+var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+```
+
+**New:**
+```zig
+var gpa: std.heap.DebugAllocator(.{}) = .init;
+```
+
+`GeneralPurposeAllocator` has been renamed to `DebugAllocator`. Note: in most programs using `pub fn main(init: std.process.Init)`, prefer `init.gpa` over creating your own allocator.
+
+### 1.12 `usingnamespace` Removed (0.15)
+
+The `usingnamespace` keyword has been **permanently removed** from the language. There is no replacement — restructure code to use explicit imports.
+
+### 1.13 `std.Io.Writer` / `std.Io.Reader` Are Non-Generic (0.15+)
+
+The old `std.io.Writer` and `std.io.Reader` were comptime-generic types. The new `std.Io.Writer` and `std.Io.Reader` (capital `I`) are **vtable-based, non-generic**:
+
+- The buffer lives **in the interface**, not the implementation
+- Hot path operates on buffer directly; vtable calls only when buffer is full/empty
+- `BufferedWriter` no longer exists — buffering is built into `std.Io.Writer`
+- `CountingWriter` no longer exists — use `std.Io.Writer.Discarding` (has a count)
+- For allocating output: `std.Io.Writer.Allocating`
+- For fixed-buffer output: `std.Io.Writer.fixed`
+
+**Custom `format` function signature changed:**
+```zig
+// Old (still compiles but {} won't call it)
+pub fn format(self: @This(), comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void
+
+// New — use {f} specifier to invoke:
+pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void
+```
+
+**IMPORTANT:** Custom `format` methods are now invoked via `{f}`, NOT `{}`. Using `{}` on a struct prints the default field representation. Example:
+```zig
+const x = MyType{ .value = 42 };
+std.debug.print("{f}", .{x});  // calls MyType.format → "MyType(42)"
+std.debug.print("{}", .{x});   // default → ".{ .value = 42 }"
+```
 
 ---
 
@@ -830,6 +909,7 @@ std.debug.print("Name: {s}, Age: {}\n", .{ name, age });
 | `{x}` | Hexadecimal |
 | `{b}` | Binary |
 | `{e}` | Scientific notation float |
+| `{f}` | **Custom format** — calls `.format(writer)` on the value (NEW in 0.16) |
 | `{any}` | Any type (debug) |
 | `{!s}` | Error name as string |
 
@@ -890,21 +970,69 @@ const hash = std.hash.Crc32.hash(data);
 
 This section details the new I/O system. **This is the single biggest change in modern Zig.**
 
+### Architecture
+
+`std.Io` is a **vtable-based interface** — just two fields:
+```zig
+const Io = struct {
+    userdata: ?*anyopaque,
+    vtable: *const VTable,
+};
+```
+
+All I/O operations dispatch through the vtable. Platform-specific backends:
+
+| Platform | Backend | Notes |
+|---|---|---|
+| Apple (macOS, iOS, etc.) | `Io.Dispatch` (Grand Central Dispatch) | Native Apple async |
+| Linux | `Io.Uring` (io_uring) | Kernel-level async I/O |
+| FreeBSD, NetBSD, OpenBSD, DragonFly | `Io.Kqueue` | BSD event notification |
+| Fallback / explicit | `Io.Threaded` | Thread-pool-based blocking I/O |
+
+Sub-modules: `Io.Reader`, `Io.Writer`, `Io.File`, `Io.Dir`, `Io.Terminal`, `Io.net`, `Io.RwLock`, `Io.Semaphore`
+
 ### `std.process.Init` ("Juicy Main")
 
 The new `main()` signature receives an `init` struct that provides everything a program needs:
 
 ```zig
+// Full definition of Init:
+pub const Init = struct {
+    minimal: Minimal,          // raw args + environ (lightweight)
+    arena: *std.heap.ArenaAllocator,  // process-lifetime allocations
+    gpa: std.mem.Allocator,    // thread-safe general purpose allocator (with leak checking in debug)
+    io: Io,                    // the universal I/O + concurrency handle
+    environ_map: *Environ.Map, // environment variables (NOT threadsafe)
+    preopens: Preopens,        // named files from parent process (mainly WASI)
+
+    pub const Minimal = struct {
+        environ: Environ,
+        args: Args,
+    };
+};
+```
+
+**Standard usage:**
+```zig
 pub fn main(init: std.process.Init) !void {
-    const io = init.io;       // threaded I/O handle (thread pool, file I/O, sleep, random)
-    const gpa = init.gpa;     // thread-safe general purpose allocator
-    const arena = init.arena;  // arena allocator
+    const io = init.io;       // threaded I/O handle (thread pool, file I/O, sleep, random, async)
+    const gpa = init.gpa;     // thread-safe allocator — prefer over creating your own DebugAllocator
+    const arena = init.arena;  // arena allocator for process-lifetime data
 }
 ```
 
-- `init.io` — A `std.Io` backed by a thread pool (CPU count - 1 threads). Provides file I/O, sleep, randomness, async dispatch.
-- `init.gpa` — Thread-safe `std.mem.Allocator`. Prefer this over creating your own `GeneralPurposeAllocator` or using `page_allocator`.
+**Lightweight alternative** — use `Init.Minimal` if you only need args/env (no I/O, no allocators):
+```zig
+pub fn main(init: std.process.Init.Minimal) !void {
+    const args = try init.args.toSlice(std.heap.page_allocator);
+    // No io, gpa, or arena available
+}
+```
+
+- `init.io` — A `std.Io` backed by a thread pool (CPU count - 1 threads). Provides file I/O, sleep, randomness, async/concurrent dispatch. On Apple platforms, the async backend uses Grand Central Dispatch.
+- `init.gpa` — Thread-safe `std.mem.Allocator` with leak checking in debug mode. Prefer this over creating your own `DebugAllocator` or using `page_allocator`.
 - `init.arena` — Arena allocator for allocations that live until program exit.
+- `init.environ_map` — Parsed environment variables. **Not threadsafe** — only access from the main thread or protect with a lock.
 
 **Note**: `pub fn main() void` and `pub fn main() !void` still work for simple programs that only use `std.debug.print()`.
 
@@ -984,15 +1112,92 @@ const sep = std.Io.Dir.path.sep_str;        // "/" or "\\"
 const full = std.Io.Dir.path.join(allocator, &.{ "src", "main.zig" });
 ```
 
-### Sleep
+### Clock, Duration, Timestamp, and Timeout
+
+All time operations go through `std.Io`. There is no standalone `std.time` module.
+
+**Clocks:**
 ```zig
-try io.sleep(std.Io.Duration.fromSeconds(2), .awake);
+const Clock = std.Io.Clock;
+
+// Available clocks:
+// .real       — wall-clock time since Unix epoch (affected by NTP)
+// .awake      — monotonic, excludes suspend time (best for measuring elapsed time)
+// .boot       — monotonic, includes suspend time
+// .cpu_process — CPU time used by this process (user + kernel)
+// .cpu_thread  — CPU time used by this thread (user + kernel)
+```
+
+**Duration (clock-agnostic):**
+```zig
+const Duration = std.Io.Duration;
+
+const d1 = Duration.fromSeconds(2);
+const d2 = Duration.fromMilliseconds(500);
+const d3 = Duration.fromMicroseconds(1000);
+const d4 = Duration.fromNanoseconds(44100);  // accepts i96
+
+const ms = d1.toMilliseconds();  // i64
+const ns = d1.toNanoseconds();   // i96
+```
+
+**Sleep:**
+```zig
+// Sleep using raw Duration + clock
+try io.sleep(Duration.fromSeconds(2), .awake);
+
+// Sleep using clock-tagged duration
+const tagged_dur = Clock.Duration{ .raw = Duration.fromMilliseconds(100), .clock = .awake };
+try tagged_dur.sleep(io);
+```
+
+**Timestamps (getting current time):**
+```zig
+// Raw timestamp
+const now = std.Io.Timestamp.now(io, .awake);
+
+// Clock-tagged timestamp
+const tagged_now = Clock.Timestamp.now(io, .real);
+
+// Measure elapsed time
+const start = std.Io.Timestamp.now(io, .awake);
+// ... do work ...
+const elapsed = start.untilNow(io, .awake);  // returns Duration
+
+// Wait until a specific time
+const deadline = Clock.Timestamp.fromNow(io, .{ .raw = Duration.fromSeconds(5), .clock = .awake });
+try deadline.wait(io);
+```
+
+**Timeout (for operations with deadlines):**
+```zig
+const Timeout = std.Io.Timeout;
+
+// No timeout
+const no_limit: Timeout = .none;
+
+// Duration-based timeout
+const dur_timeout: Timeout = .{ .duration = .{ .raw = Duration.fromSeconds(5), .clock = .awake } };
+
+// Deadline-based timeout
+const deadline_timeout: Timeout = .{ .deadline = tagged_timestamp };
+
+// Used with operations:
+try batch.awaitConcurrent(io, dur_timeout);
+```
+
+**Clock resolution:**
+```zig
+const res = try Clock.awake.resolution(io);  // returns Duration
 ```
 
 ### Randomness
 ```zig
 var seed: u64 = undefined;
 io.random(std.mem.asBytes(&seed));
+
+// Cryptographically secure random
+try io.randomSecure(buffer);
 
 var prng = std.Random.DefaultPrng.init(seed);
 const rnd = prng.random();
@@ -1103,8 +1308,9 @@ Note: `@cImport` is evaluated at comptime.
 
 ---
 
-## 22. Threading
+## 22. Threading and Structured Concurrency
 
+### Basic Threading
 ```zig
 const std = @import("std");
 
@@ -1127,6 +1333,120 @@ fn threadFn() !void {
 }
 ```
 
+### Async / Concurrent (via `std.Io`)
+
+There are **no language-level async/await keywords**. All async is library-level on `std.Io`.
+
+**`io.async`** — dispatch work, may run inline (eager execution allowed):
+```zig
+fn computeFFT(io: std.Io, data: []f32) []f32 {
+    // ... expensive work ...
+}
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+
+    // Dispatch async — may run on thread pool or inline
+    var future = io.async(computeFFT, .{ io, my_data });
+    // ... do other work while it runs ...
+    const result = future.await(io);  // block until done
+}
+```
+
+**`io.concurrent`** — guaranteed parallel execution (requires thread pool thread):
+```zig
+// Must use actual parallelism — can fail if pool exhausted
+var future = try io.concurrent(computeFFT, .{ io, my_data });
+const result = future.await(io);
+```
+
+**Key difference:** `async` may execute eagerly (good for I/O-bound work). `concurrent` guarantees a separate thread (good for CPU-bound work like DSP). Use `concurrent` when you need true parallelism.
+
+### Future API
+```zig
+// Await result (blocks until ready, idempotent, NOT threadsafe)
+const result = future.await(io);
+
+// Cancel (requests cancellation, blocks until task finishes)
+// Task receives error.Canceled at next cancellation point
+const result = future.cancel(io);
+```
+
+### Group — Unordered Task Set
+```zig
+var group: std.Io.Group = .init;
+
+// Functions used with Group MUST return Cancelable!void (i.e. error{Canceled}!void)
+fn taskA(x: *u32) std.Io.Cancelable!void { x.* += 1; }
+
+// Spawn multiple tasks into the group
+group.async(io, taskA, .{&val_a});
+group.async(io, taskA, .{&val_b});
+try group.concurrent(io, taskA, .{&val_c});
+
+// Wait for ALL tasks to complete
+try group.await(io);
+
+// Or cancel all tasks
+group.cancel(io);
+```
+
+Resources for each task are released when the individual task returns, not when the group completes. Tasks can only be awaited/cancelled as a whole.
+
+### Select — Structured Concurrency with Tagged Results
+```zig
+// Await the FIRST completed result from multiple async tasks of different types
+const ResultUnion = union(enum) {
+    download: []u8,
+    compute: f64,
+    timeout: void,
+};
+
+var select = std.Io.Select(ResultUnion).init(io, &result_buffer);
+select.async(.download, downloadFn, .{url});
+select.async(.compute, computeFn, .{data});
+select.async(.timeout, timeoutFn, .{duration});
+
+// Get first completed result
+const first = try select.await();
+switch (first) {
+    .download => |bytes| { ... },
+    .compute => |val| { ... },
+    .timeout => { ... },
+}
+
+// Clean up remaining tasks
+select.cancelDiscard();
+```
+
+### Cancellation
+```zig
+// Check for cancellation in long-running CPU-bound code
+try io.checkCancel();  // returns error.Canceled if cancelled
+
+// Block cancellation in a critical section
+const prev = io.swapCancelProtection(.blocked);
+defer _ = io.swapCancelProtection(prev);
+
+// Re-arm cancellation (so NEXT cancellation point also gets error.Canceled)
+io.recancel();
+```
+
+Every `Io` operation that can return `error.Canceled` is a "cancellation point". Use `checkCancel()` in tight loops to allow cancellation of CPU-bound work.
+
+### Batch — Low-Level Operation Batching
+```zig
+var batch = std.Io.Batch.init(&storage);
+_ = batch.add(operation1);
+_ = batch.add(operation2);
+
+// Execute all operations, await results
+try batch.awaitAsync(io);
+
+// Or with timeout
+try batch.awaitConcurrent(io, timeout);
+```
+
 ---
 
 ## 23. Common Pitfalls for LLMs
@@ -1138,24 +1458,31 @@ fn threadFn() !void {
 4. **`@intCast(T, value)`** → Use `const x: T = @intCast(value)` (single arg, type inferred)
 5. **`@enumToInt()`** → Use `@intFromEnum()`
 6. **`@typeInfo(T).Struct`** → Use `@typeInfo(T).@"struct"`
-7. **`suspend`/`resume`/`nosuspend`** → Old frame-based async is gone. Use `io.async()` / `.await()` for new thread-pool async
+7. **`suspend`, `resume`, `nosuspend`, `@frameSize`** → Old 0.11-era frame-based async is gone. Use `io.async(fn, .{args})` / `future.await(io)` — async/await restored in 0.16 via `std.Io`
 8. **`std.mem.split()`** → Use `std.mem.splitSequence()` or `std.mem.splitScalar()`
 9. **`std.ArrayList(T).init(alloc)`** → Use `std.ArrayList(T) = .empty`, pass allocator per-operation
 10. **`std.os.`** → Use `std.posix.`
 11. **`std.rand.`** → Use `std.Random.`
 12. **`std.heap.page_allocator` in main** → Prefer `init.gpa` from `std.process.Init`
-13. **Creating your own `GeneralPurposeAllocator`** → Prefer `init.gpa` from `std.process.Init`
+13. **`std.heap.GeneralPurposeAllocator`** → Renamed to `std.heap.DebugAllocator`. Prefer `init.gpa` in main.
+14. **`usingnamespace`** → Permanently removed from the language
+15. **`std.io.Writer` / `std.io.Reader`** (lowercase) → Use `std.Io.Writer` / `std.Io.Reader` (capital `I`, vtable-based)
+16. **`BufferedWriter`** → Buffering is now built into `std.Io.Writer`
+17. **Old `format` signature with `comptime fmt`** → New: `fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void` — invoked via `{f}` not `{}`
 
 ### DO generate:
 1. `std.debug.print()` for quick output — it still works with no I/O setup
 2. `pub fn main() void` for simple programs that only use `std.debug.print()`
 3. `pub fn main(init: std.process.Init) !void` for programs that need I/O
-4. Single-argument builtins with type inferred from context
-5. `inline else` for union dispatch (interface pattern)
-6. Multi-object `for` loops for parallel iteration
-7. `.{}` anonymous struct/tuple syntax
-8. `0..` open-ended ranges in for loops
-9. `io.async(fn, .{args})` / `.await()` for thread-pool-based async (restored in 0.16)
+4. `pub fn main(init: std.process.Init.Minimal) !void` for lightweight programs (args/env only)
+5. Single-argument builtins with type inferred from context
+6. `inline else` for union dispatch (interface pattern)
+7. Multi-object `for` loops for parallel iteration
+8. `.{}` anonymous struct/tuple syntax
+9. `0..` open-ended ranges in for loops
+10. `io.async(fn, .{args})` / `future.await(io)` for async dispatch (library-level, not keywords)
+11. `try io.concurrent(fn, .{args})` for guaranteed parallel execution (CPU-bound work)
+12. `std.Io.Group` / `std.Io.Select` for structured concurrency
 
 ### Data-Oriented Design
 
@@ -1180,12 +1507,15 @@ for (points) |p| { ... }
 |------|---------|-----------|
 | 2024-06 | 0.14.0-dev.42 | `std.mem.split`/`tokenize` renamed |
 | 2024-09 | 0.14.0-dev.1573 | Labeled switch introduced |
-| 2025-07 | 0.15.0-dev.1092 | New `std.Io` interface (first wave) |
+| 2025-07 | 0.15.0-dev.1092 | New `std.Io` interface (first wave); `usingnamespace` removed |
 | 2025-08 | 0.15.0-dev.1519 | ArrayList API changes |
+| 2025-08 | **0.15.1 stable** | async/await keywords removed (later restored in 0.16); `std.Io.Writer`/`Reader` vtable-based; non-generic I/O |
+| 2025-10 | **0.15.2 stable** | Latest stable release |
 | 2025-12 | 0.16.0-dev.1859 | File system I/O integrated with `std.Io` |
 | 2026-01 | 0.16.0-dev.1976 | Process API moved to `std.Io`; `main(init)` pattern |
 | 2026-01 | 0.16.0-dev.2075 | Randomness API moved to `std.Io` |
 | 2026-02 | 0.16.0-dev.2471 | `process.Child.Cwd` added |
+| 2026-03 | 0.16.0-dev.2915 | `GeneralPurposeAllocator` renamed to `DebugAllocator` |
 
 ---
 
@@ -1201,7 +1531,7 @@ Check what version of Zig the user is targeting. Look for:
 - `build.zig` in their project — search for a version string like `"0.16.0-dev.2471"`
 - Or ask: "What version of Zig are you using?" (`zig version`)
 
-The version this document was last updated for: **0.16.0-dev.2471** (February 2026).
+The version this document was last updated for: **0.16.0-dev.2915** (March 2026).
 
 #### Step 2: Check Primary Sources (in priority order)
 
@@ -1277,8 +1607,18 @@ echo 'const std = @import("std"); pub fn main(init: std.process.Init) !void { va
 
 | What Changed? | Check This File |
 |---|---|
-| I/O interface | `lib/std/Io.zig`, `lib/std/Io/Writer.zig`, `lib/std/Io/File.zig` |
-| File system | `lib/std/Io/Dir.zig` |
+| I/O interface (core) | `lib/std/Io.zig` (Duration, Clock, Timestamp, Timeout, Future, Group, Select, Batch) |
+| I/O Reader/Writer | `lib/std/Io/Writer.zig`, `lib/std/Io/Reader.zig` |
+| File I/O | `lib/std/Io/File.zig` |
+| File system / dirs | `lib/std/Io/Dir.zig` |
+| Networking | `lib/std/Io/net.zig` |
+| Terminal | `lib/std/Io/Terminal.zig` |
+| Threaded backend | `lib/std/Io/Threaded.zig` |
+| Apple GCD backend | `lib/std/Io/Dispatch.zig` |
+| Linux io_uring backend | `lib/std/Io/Uring.zig` |
+| BSD kqueue backend | `lib/std/Io/Kqueue.zig` |
+| Fiber / coroutine | `lib/std/Io/fiber.zig` |
+| Concurrency primitives | `lib/std/Io/RwLock.zig`, `lib/std/Io/Semaphore.zig` |
 | Process / main() | `lib/std/process.zig` |
 | Build system | `lib/std/Build.zig`, `lib/std/Build/Step.zig` |
 | ArrayList | `lib/std/array_list.zig` |
@@ -1286,15 +1626,18 @@ echo 'const std = @import("std"); pub fn main(init: std.process.Init) !void { va
 | Formatting | `lib/std/fmt.zig`, `lib/std/Io/Writer.zig` |
 | Builtins | `lib/std/builtin.zig` |
 | Random | `lib/std/Random.zig` |
+| Allocators | `lib/std/heap.zig`, `lib/std/heap/DebugAllocator.zig` |
 
 ---
 
 ## Useful Resources
 
 - **Zig Language Reference**: https://ziglang.org/documentation/master/
-- **Zig Guide**: https://zig.guide
+- **Zig Standard Library Docs**: https://ziglang.org/documentation/master/std/
+- **Zig Guide (0.15.2)**: https://zig.guide
 - **Zig Source (Codeberg)**: https://codeberg.org/ziglang/zig
 - **Zig Standard Library Source**: https://codeberg.org/ziglang/zig/src/branch/master/lib/std/
+- **0.15.1 Release Notes** (major breaking changes): https://ziglang.org/download/0.15.1/release-notes.html
 - **Ziglings Exercises**: https://codeberg.org/ziglings/exercises
 - **Build from Source**: https://codeberg.org/ziglang/zig#building-from-source
-- **std.Io Writer docs**: `lib/std/Io/Writer.zig` in the Zig source tree
+- **Zig Devlog**: https://ziglang.org/devlog/2026/
