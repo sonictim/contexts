@@ -1,8 +1,8 @@
 # Zig 0.16 Language Context for LLMs
 
-> **Purpose**: This document provides comprehensive, up-to-date context on the Zig programming language as of **Zig 0.16.0-dev** (March 2026). Most LLMs were trained on Zig 0.11–0.13 era code, which is now significantly outdated. Use this document to avoid generating broken or deprecated Zig code.
+> **Purpose**: This document provides comprehensive, up-to-date context on the Zig programming language as of **Zig 0.16.0 stable** (released April 2026). Most LLMs were trained on Zig 0.11–0.13 era code, which is now significantly outdated. Use this document to avoid generating broken or deprecated Zig code.
 
-> **Sources**: Ziglings exercises (targeting 0.16.0-dev.2915), Zig source repository on Codeberg, ziglang.org, zig.guide. Last updated: 2026-03-26.
+> **Sources**: [0.16.0 release notes](https://ziglang.org/download/0.16.0/release-notes.html), Ziglings exercises, Zig source repository on Codeberg, ziglang.org, zig.guide. Last updated: 2026-04-16.
 
 ---
 
@@ -112,11 +112,15 @@ const fields = @typeInfo(MyStruct).@"struct".fields;
 
 Union tag names in `@typeInfo` are now lowercase and since `struct`, `enum`, `union`, `fn` etc. are keywords, they require the `@"..."` quoted identifier syntax.
 
-### 1.5 Async/Await Restored in 0.16
+### 1.5 Async/Await Are Back in 0.16 (But `suspend`/`resume` Are Not)
 
-Async/await was removed after 0.11 and the keywords were removed in 0.15, but **async/await has been restored in 0.16** with a completely new implementation backed by `std.Io`. This is NOT the old 0.11-era frame-based `suspend`/`resume`/`nosuspend` system — those are still gone.
+**`async` and `await` are real language features again in Zig 0.16.** They were removed after 0.11 and absent through 0.15, but 0.16 restored them with a completely new implementation built on top of `std.Io`. The usage looks like method-call syntax — `io.async(fn, .{args})` and `future.await(io)` — but `async` and `await` are part of the language, not just method names. Treat them as first-class.
 
-The new async works with the `std.Io` interface, which is vtable-based and dispatches to platform-specific backends (Grand Central Dispatch on Apple, io_uring on Linux, kqueue on BSDs).
+What is **still gone** (and is NOT coming back) is the **0.11-era frame-based system**: `suspend`, `resume`, `nosuspend`, and `@frameSize`. Those were tied to the old stackful-coroutine model and were removed in 0.15. The new async/await is thread-pool / fiber / io_uring based via `std.Io`, not frame-based.
+
+> **TL;DR for LLMs:** `async` + `await` = YES in 0.16. `suspend`/`resume`/`nosuspend`/`@frameSize` = still gone.
+
+The backing runtime dispatches through `std.Io` to platform-specific backends (Grand Central Dispatch on Apple, io_uring on Linux, kqueue on BSDs, thread pool as fallback).
 
 **Two tiers of concurrency:**
 
@@ -148,7 +152,9 @@ defer _ = io.swapCancelProtection(prev);
 
 **See Section 22 for full structured concurrency details (Group, Select, Batch).**
 
-**DO NOT generate:** `suspend`, `resume`, `nosuspend`, `@frameSize` — the old 0.11-era frame-based async primitives are gone. The new async/await in 0.16 is thread-pool-based via `std.Io`.
+**DO generate:** `io.async(fn, .{args})` and `future.await(io)` — `async` and `await` are real 0.16 language features.
+
+**DO NOT generate:** `suspend`, `resume`, `nosuspend`, `@frameSize` — these are the 0.11-era frame-based primitives, removed in 0.15 and NOT coming back. The new async/await does not use them.
 
 ### 1.6 `std.time`, `std.fs`, and Other APIs Moved to `std.Io`
 
@@ -196,7 +202,9 @@ const self: *ZiglingStep = @alignCast(@fieldParentPtr("step", step));
 
 Type is inferred from the result; `@alignCast` is often needed alongside.
 
-### 1.10 ArrayList API Change
+### 1.10 Containers: `.empty` + Per-Operation Allocator (Unmanaged-by-Default)
+
+The "managed" container variants (that stored an allocator internally) were removed. The remaining containers are all "unmanaged" — they're initialized with the `.empty` constant (no allocator stored) and you pass the allocator into every operation that allocates.
 
 **Old (BROKEN):**
 ```zig
@@ -210,9 +218,40 @@ try list.append(42);
 var list: std.ArrayList(u32) = .empty;
 defer list.deinit(allocator);
 try list.append(allocator, 42);
+try list.appendSlice(allocator, &.{ 10, 20, 30 });
 ```
 
-The allocator is now passed to each operation rather than stored in the struct. Initialize with `.empty` instead of `.init(allocator)`.
+This `.empty` + per-op-allocator pattern is the idiom across standard containers in 0.16. The `.Unmanaged` suffix is gone — the base name IS the unmanaged version. Representative list (verify exact signature against `lib/std/` for the container you're using):
+
+| Container | Init | Example op |
+|---|---|---|
+| `std.ArrayList(T)` | `= .empty` | `list.append(allocator, x)` |
+| `std.ArrayListAligned(T, a)` | `= .empty` | `list.append(allocator, x)` |
+| `std.AutoHashMap(K, V)` | `= .empty` | `map.put(allocator, k, v)` |
+| `std.AutoArrayHashMap(K, V)` | `= .empty` | `map.put(allocator, k, v)` |
+| `std.StringHashMap(V)` | `= .empty` | `map.put(allocator, k, v)` |
+| `std.StringArrayHashMap(V)` | `= .empty` | `map.put(allocator, k, v)` |
+| `std.HashMap(K, V, Ctx, load)` | `= .empty` | `map.put(allocator, k, v)` |
+| `std.MultiArrayList(T)` | `= .empty` | `list.append(allocator, x)` |
+| `std.SinglyLinkedList` | `= .empty` | `list.prepend(&node)` (no alloc) |
+| `std.DoublyLinkedList` | `= .empty` | `list.append(&node)` (no alloc) |
+| `std.PriorityQueue(T, Ctx, cmp)` | `= .empty` | `pq.add(allocator, x)` |
+| `std.ArrayHashMap(...)` | `= .empty` | `map.put(allocator, k, v)` |
+
+**Pattern recap — three-line lifecycle:**
+```zig
+var things: std.ArrayList(Thing) = .empty;
+defer things.deinit(allocator);
+try things.append(allocator, thing);
+```
+
+**Don't write `.init(allocator)`** for these — it either won't compile or will call a differently-named constructor that does something else. If a container genuinely needs an init arg (e.g. `PriorityQueue`'s context), the pattern is `= .init(ctx)` with allocator *still* passed per-op.
+
+**Also `.empty` (not `.init`) is the convention for:**
+- `std.Io.Group` — `var group: std.Io.Group = .empty;` or similar — see §22
+- User-defined containers — if your struct has a sensible zero-state, declare `pub const empty: @This() = .{ ... };` and init with `= .empty`
+
+**Contrast with `.init`:** Reserve `.init` for types that genuinely need construction parameters (`std.heap.ArenaAllocator.init(child)`, `std.Random.DefaultPrng.init(seed)`, `std.heap.DebugAllocator(.{}) = .init`). If no params are needed, `.empty` is preferred.
 
 ### 1.11 `GeneralPurposeAllocator` → `DebugAllocator` (0.16, March 2026)
 
@@ -245,7 +284,8 @@ The old `std.io.Writer` and `std.io.Reader` were comptime-generic types. The new
 
 **Custom `format` function signature changed:**
 ```zig
-// Old (still compiles but {} won't call it)
+// Old (BROKEN in 0.16 — std.fmt.FormatOptions was renamed to std.fmt.Options,
+// and the `comptime fmt`/`anytype writer` shape is no longer used by {})
 pub fn format(self: @This(), comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void
 
 // New — use {f} specifier to invoke:
@@ -258,6 +298,238 @@ const x = MyType{ .value = 42 };
 std.debug.print("{f}", .{x});  // calls MyType.format → "MyType(42)"
 std.debug.print("{}", .{x});   // default → ".{ .value = 42 }"
 ```
+
+### 1.14 `@Type` Removed — Specialized Type-Creation Builtins (0.16 stable)
+
+The generic `@Type` builtin is **gone** in 0.16. It's replaced by a family of specialized builtins, one per type kind:
+
+**Old (BROKEN):**
+```zig
+const U10 = @Type(.{ .int = .{ .signedness = .unsigned, .bits = 10 } });
+```
+
+**New:**
+```zig
+const U10 = @Int(.unsigned, 10);
+```
+
+New builtins:
+
+| Builtin | Purpose |
+|---|---|
+| `@Int(signedness, bits)` | Arbitrary-width integer type |
+| `@Tuple(field_types)` | Tuple type from a slice of types |
+| `@Pointer(size, attrs, Element, sentinel)` | Pointer type |
+| `@Struct(layout, BackingInt, names, types, attrs)` | Struct type |
+| `@Union(layout, ArgType, names, types, attrs)` | Union type |
+| `@Enum(TagInt, mode, names, values)` | Enum type |
+| `@Fn(param_types, param_attrs, ReturnType, attrs)` | Function type |
+| `@EnumLiteral()` | The `enum literal` type |
+
+No replacement builtins exist for `@Array`, `@Float`, `@Optional`, `@ErrorUnion`, or `@ErrorSet` — use literal syntax (`[N]T`, `f32`, `?T`, `E!T`, `error{...}`) instead.
+
+### 1.15 Packed Unions Require Explicit Backing Integer (0.16 stable)
+
+Packed unions now **must** specify a backing integer type, just like packed enums:
+
+**Old (BROKEN):**
+```zig
+const U = packed union { x: u16, y: u16 };
+```
+
+**New:**
+```zig
+const U = packed union(u16) { x: u16, y: u16 };
+```
+
+Related rules (also new/tightened in 0.16):
+- Pointers are **forbidden** inside `packed struct` and `packed union`.
+- All fields of a `packed union` must have the same `@bitSizeOf`.
+- Packed/enum types with implicit backing integer types are **forbidden in extern contexts** — you must pick an explicit backing int.
+
+Packed unions can also now appear as switch prong items (compared by backing integer):
+```zig
+const U = packed union(u2) { a: i2, b: u2 };
+const u: U = .{ .a = -1 };
+switch (u) {
+    .{ .b = 3 } => {},  // matches because bit pattern is the same
+    else => unreachable,
+}
+```
+
+### 1.16 Float → Integer via `@round`/`@floor`/`@ceil`/`@trunc` (0.16 stable)
+
+These four builtins now convert **directly** to an integer type when the destination is an integer — no separate `@intFromFloat` needed:
+
+```zig
+const x: u8 = @round(12.5);   // 12, result is u8 directly
+const y: i32 = @floor(-1.7);  // -2
+```
+
+With a float destination they still produce a float (as before).
+
+### 1.17 Small Integer → Float Coercion (0.16 stable)
+
+Integer types whose **every value fits exactly** in a target float will now coerce implicitly:
+
+```zig
+var foo_int: u24 = 123;
+var foo_float: f32 = foo_int;  // OK — 24 bits fit in f32 mantissa
+```
+
+This skips the explicit `@floatFromInt` when the compiler can prove the conversion is lossless.
+
+### 1.18 Pointer Alignment Types Are Distinct (0.16 stable)
+
+`*T` (naturally aligned) and `*align(1) T` (explicitly aligned) are now **distinct types**. They still coerce to each other in most contexts, but `@TypeOf` will reflect the difference, and comparisons like `@TypeOf(a) == @TypeOf(b)` may now return `false` where they previously returned `true`.
+
+### 1.19 Concurrency Primitives Moved to `std.Io` (0.16 stable)
+
+Synchronization primitives migrated off `std.Thread` and onto `std.Io`:
+
+| Old (BROKEN in 0.16) | New |
+|---|---|
+| `std.Thread.Mutex` | `std.Io.Mutex` |
+| `std.Thread.ResetEvent` | `std.Io.Event` |
+| `std.Thread.Condition` | `std.Io.Condition` |
+| `std.Thread.Semaphore` | `std.Io.Semaphore` |
+| `std.Thread.RwLock` | `std.Io.RwLock` |
+| `std.Thread.WaitGroup` | `std.Io.Group` |
+| `std.Thread.Futex` | `std.Io.Futex` |
+| `std.Thread.Mutex.Recursive` | **removed** — rethink the design; recursive locking was a footgun |
+| `std.once` | **removed** — avoid global init; use explicit init funcs |
+| `std.Thread.Pool` | **removed** — use `io.async` / `io.concurrent` / `std.Io.Group` |
+| `std.heap.ThreadSafeAllocator` | **removed** — `std.heap.ArenaAllocator` is now thread-safe + lock-free; `init.gpa` is also thread-safe |
+
+### 1.20 Error Set Renames (0.16 stable)
+
+Several commonly-seen errors were renamed for consistency:
+
+| Old | New |
+|---|---|
+| `error.RenameAcrossMountPoints` | `error.CrossDevice` |
+| `error.NotSameFileSystem` | `error.CrossDevice` |
+| `error.SharingViolation` | `error.FileBusy` |
+| `error.EnvironmentVariableNotFound` | `error.EnvironmentVariableMissing` |
+
+### 1.21 Process Spawning Simplified (0.16 stable)
+
+**Old pattern:**
+```zig
+var child = std.process.Child.init(argv, gpa);
+try child.spawn(io);
+```
+
+**New pattern:**
+```zig
+var child = try std.process.spawn(io, .{
+    .argv = argv,
+    .stdin = .pipe,
+    .stdout = .pipe,
+});
+```
+
+`std.process.spawn` replaces the manual `Child.init` + `spawn` two-step.
+
+### 1.22 `std.process` Consolidation (0.16 stable)
+
+A batch of self-exe/cwd/exec helpers moved from `std.fs` → `std.process`, and `Child.run` / `execv` were renamed:
+
+| Old (BROKEN) | New |
+|---|---|
+| `std.process.Child.init(argv, gpa)` + `.spawn(io)` | `try std.process.spawn(io, .{ .argv = argv, ... })` |
+| `std.process.Child.run(...)` | `std.process.run(...)` |
+| `std.process.execv(...)` | `std.process.replace(...)` |
+| `std.fs.openSelfExe(...)` | `std.process.openExecutable(io, ...)` |
+| `std.fs.selfExePath(buf)` | `std.process.executablePath(io, buf)` |
+| `std.fs.selfExePathAlloc(allocator)` | `std.process.executablePathAlloc(io, allocator)` |
+| `std.fs.selfExeDirPath(buf)` | `std.process.executableDirPath(io, buf)` |
+| `std.fs.selfExeDirPathAlloc(allocator)` | `std.process.executableDirPathAlloc(io, allocator)` |
+| `std.fs.Dir.setAsCwd()` | `std.process.setCurrentDir(io, dir)` |
+
+Environment variables and process args are also now **non-global** — go through `init.environ_map` / `init.minimal.args` from `std.process.Init`, not a module-level global.
+
+### 1.23 `std.fmt` Renames (0.16 stable)
+
+| Old (BROKEN) | New |
+|---|---|
+| `std.fmt.FormatOptions` | `std.fmt.Options` |
+| `std.fmt.Formatter` | `std.fmt.Alt` |
+| `std.fmt.format(writer, ...)` | `std.Io.Writer.print(writer, ...)` |
+| `std.fmt.bufPrintZ` | `std.fmt.bufPrintSentinel` |
+
+### 1.24 Removed I/O Shims (0.16 stable)
+
+The following no longer exist — they're subsumed by the non-generic `std.Io.Writer`/`std.Io.Reader`:
+
+- `std.Io.GenericReader`, `std.Io.AnyReader`
+- `std.Io.GenericWriter`, `std.Io.AnyWriter`
+- `std.Io.FixedBufferStream` — use `std.Io.Writer.fixed(...)` or build on a `Reader` directly
+- `std.Io.CountingReader` — parallel removal to `CountingWriter` (use `std.Io.Writer.Discarding` for writers; for readers, track offsets yourself)
+- `std.Io.null_writer` — use `std.Io.Writer.Discarding`
+
+### 1.25 File API: Streaming vs Positional, `Reader`-Owned Seeks (0.16 stable)
+
+`std.Io.File` read/write methods split into two families based on whether the operation uses the file's implicit cursor (streaming) or an explicit offset (positional). Seeks moved off `File` onto `File.Reader`:
+
+| Old `std.fs.File` | New `std.Io.File` |
+|---|---|
+| `file.read(buf)` / `file.readv(iov)` | `file.readStreaming(io, buf)` |
+| `file.pread(buf, offset)` / `file.preadv` / `file.preadAll` | `file.readPositional(io, buf, offset)` / `readPositionalAll` |
+| `file.write(bytes)` / `file.writev(iov)` / `file.writeAll` | `file.writeStreaming(io, bytes)` / `writeStreamingAll` |
+| `file.pwrite(bytes, off)` / `pwritev` / `pwriteAll` | `file.writePositional(io, bytes, off)` / `writePositionalAll` |
+| `file.seekTo/seekBy/seekFromEnd(n)` | `file.reader(io, &buf).seekTo(n)` etc. (lives on `Reader`) |
+| `file.getPos()` | `file_reader.logicalPos()` |
+| `file.getEndPos()` | `file.length(io)` |
+| `file.setEndPos(n)` | `file.setLength(io, n)` |
+| `file.mode()` | `file.stat(io).permissions.toMode()` |
+| `file.chmod(m)` / `file.chown(...)` | `file.setPermissions(io, p)` / `file.setOwner(io, ...)` |
+| `file.updateTimes(...)` | `file.setTimestamps(io, ...)` / `setTimestampsNow(io)` |
+| `std.fs.File.Mode` / `PermissionsWindows` / `PermissionsUnix` | `std.Io.File.Permissions` (unified) |
+| `std.fs.File.default_mode` | `std.Io.File.Permissions.default_file` |
+
+Directory-side renames worth knowing: `Dir.makeDir` → `createDir`, `Dir.makePath` → `createDirPath`, `Dir.makeOpenDir` → `createDirPathOpen`, `Dir.realpath`/`realpathAlloc` → `realPathFile`/`realPathFileAlloc`. Legacy `fs.path`, `fs.max_path_bytes`, `fs.max_name_bytes` are deprecated in favor of `std.Io.Dir.path` / `Dir.max_path_bytes` / `Dir.max_name_bytes`. The platform-suffixed variants (`*Z`, `*W`, `*Wasi`) and the `adaptToNewApi`/`adaptFromNewApi` shims are gone — use the unified `std.Io` APIs.
+
+### 1.26 Vector Restrictions (0.16 stable)
+
+Two breaking vector rules:
+
+1. **Runtime indexing is forbidden.** Use `@shuffle`, `@reduce`, or convert to an array first (`const arr: [N]T = v;`) for runtime-indexed access.
+2. **Vectors and arrays no longer in-memory coerce.** You must explicitly convert:
+   ```zig
+   const v: @Vector(4, f32) = .{ 1, 2, 3, 4 };
+   const a: [4]f32 = v;                // OK — assignment coercion still works
+   // @as(*[4]f32, &v)                  // NOT OK in 0.16 — pointers don't coerce
+   ```
+   Assignment between `[N]T` and `@Vector(N, T)` still works, but you cannot reinterpret pointers between them.
+
+### 1.27 Unary Float Builtins Forward Result Types (0.16 stable)
+
+These now participate in result-type inference so the output element/float type is taken from context:
+
+`@sqrt`, `@sin`, `@cos`, `@tan`, `@exp`, `@exp2`, `@log`, `@log2`, `@log10`
+
+```zig
+const x: f32 = 2.0;
+const y: f64 = @sqrt(x);   // widens to f64 via result-type inference
+```
+
+Previously they always returned the same float type as the argument.
+
+### 1.28 Miscellaneous Language Tightenings (0.16 stable)
+
+- **Zero-bit tuple fields are no longer implicitly `comptime`** — if you want compile-time-only, annotate explicitly.
+- **You cannot return the address of a trivial local variable** from a function (would dangle).
+- **Pointers to comptime-only types are no longer themselves comptime-only.**
+- **Switch prong captures may no longer all be discarded** — at least one capture in the prong set must be used. (Other switch wins: packed structs as prong items, decl literals as prong items, union-tag captures allowed on all prongs not just `inline`, and prongs whose value isn't in the error set are allowed if the body is `=> comptime unreachable`.)
+- **`@cImport` is DEPRECATED** (not just discouraged) — migrate to `b.addTranslateC(...)` in `build.zig`.
+
+### 1.29 `std.SegmentedList` and `std.meta.declList` Removed (0.16 stable)
+
+- `std.SegmentedList` is gone — use `std.ArrayList` with `.empty`, or a custom chunked structure if you specifically needed stable element addresses.
+- `std.meta.declList` is gone — iterate `@typeInfo(T).@"struct".decls` or similar directly.
+
+Other smaller removals: `std.DynLib` no longer supports Windows; `std.math.sign` now returns the smallest int type that fits the input.
 
 ---
 
@@ -575,8 +847,9 @@ const allocator = arena.allocator();
 const buf = try allocator.alloc(u8, 1024);
 defer allocator.free(buf);
 
-// General purpose allocator (individual alloc/free)
-var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+// Debug allocator (individual alloc/free, leak-checked in debug builds)
+// Note: was `GeneralPurposeAllocator` before 0.16; prefer `init.gpa` in main().
+var gpa: std.heap.DebugAllocator(.{}) = .init;
 defer _ = gpa.deinit();
 const allocator = gpa.allocator();
 ```
@@ -845,6 +1118,23 @@ These locations are always evaluated at comptime:
 | `@splat(value)` | Create vector with all elements = value |
 | `@reduce(op, vec)` | Reduce vector to scalar |
 | `@abs(value)` | Absolute value |
+| `@round(f)` / `@floor(f)` / `@ceil(f)` / `@trunc(f)` | With an integer destination type, converts directly to int (0.16+) |
+| `@sqrt` / `@sin` / `@cos` / `@tan` / `@exp` / `@exp2` / `@log` / `@log2` / `@log10` | Unary float; in 0.16 these forward result types (output float type inferred from context) |
+
+### Type-Creation Builtins (0.16+, replace removed `@Type`)
+
+| Builtin | Purpose |
+|---|---|
+| `@Int(signedness, bits)` | Arbitrary-width integer |
+| `@Tuple(field_types)` | Tuple type |
+| `@Pointer(size, attrs, Element, sentinel)` | Pointer type |
+| `@Struct(layout, BackingInt, names, types, attrs)` | Struct type |
+| `@Union(layout, ArgType, names, types, attrs)` | Union type |
+| `@Enum(TagInt, mode, names, values)` | Enum type |
+| `@Fn(param_types, param_attrs, ReturnType, attrs)` | Function type |
+| `@EnumLiteral()` | Enum literal type |
+
+For `@Array`, `@Float`, `@Optional`, `@ErrorUnion`, `@ErrorSet` — use literal syntax (`[N]T`, `f32`, `?T`, `E!T`, `error{...}`).
 
 ---
 
@@ -884,10 +1174,16 @@ const abs_v = @abs(v1);           // builtins work on vectors
 const broadcast: @Vector(4, i32) = @splat(5);   // { 5, 5, 5, 5 }
 const total = @reduce(.Add, v1);                 // 10
 
-// Convert between arrays and vectors
+// Assignment coercion between arrays and vectors still works
 const arr: [4]i32 = v1;
 const vec: @Vector(4, i32) = arr;
 ```
+
+### 0.16 Rules (see §1.26)
+
+- **No runtime indexing of vectors.** `v[i]` with runtime `i` is a compile error. Use `@shuffle`, `@reduce`, or convert to an array first (`const a: [N]T = v;` then `a[i]`).
+- **No in-memory coercion between vectors and arrays.** Value assignment still coerces, but you cannot reinterpret a `*[N]T` as `*@Vector(N, T)` (or vice versa) — the in-memory layouts are no longer guaranteed to match.
+- Unary float builtins (`@sqrt`, `@sin`, `@cos`, `@tan`, `@exp`, `@exp2`, `@log`, `@log2`, `@log10`) now forward result types, so they infer the element type from context when operating on vectors too.
 
 ---
 
@@ -943,6 +1239,7 @@ std.math.pow(u32, base, exp)
 std.math.pi
 std.math.maxInt(u8)           // 255
 std.math.minInt(i8)           // -128
+std.math.sign(x)              // 0.16+: returns smallest int type that fits
 ```
 
 ### ASCII (`std.ascii`)
@@ -989,7 +1286,7 @@ All I/O operations dispatch through the vtable. Platform-specific backends:
 | FreeBSD, NetBSD, OpenBSD, DragonFly | `Io.Kqueue` | BSD event notification |
 | Fallback / explicit | `Io.Threaded` | Thread-pool-based blocking I/O |
 
-Sub-modules: `Io.Reader`, `Io.Writer`, `Io.File`, `Io.Dir`, `Io.Terminal`, `Io.net`, `Io.RwLock`, `Io.Semaphore`
+Sub-modules: `Io.Reader`, `Io.Writer`, `Io.File`, `Io.Dir`, `Io.Terminal`, `Io.net`, `Io.Mutex`, `Io.RwLock`, `Io.Condition`, `Io.Event`, `Io.Semaphore`, `Io.Futex`, `Io.Group`, `Io.Select`, `Io.Batch`, `Io.Clock`, `Io.Duration`, `Io.Timestamp`, `Io.Timeout`, `Io.Threaded`, `Io.Evented`, `Io.Uring`, `Io.Dispatch`, `Io.Kqueue`
 
 ### `std.process.Init` ("Juicy Main")
 
@@ -1270,6 +1567,30 @@ const test_step = b.step("test", "Run unit tests");
 test_step.dependOn(&run_tests.step);
 ```
 
+### C Translation via Build System (0.16+)
+
+`@cImport` inside source files is being phased out in favor of an explicit build-system step. This makes caching and cross-compilation deterministic:
+
+```zig
+// In build.zig
+const translate_c = b.addTranslateC(.{
+    .root_source_file = b.path("src/c.h"),
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("c", translate_c.createModule());
+```
+
+Then in Zig source: `const c = @import("c");` — no `@cImport` needed.
+
+`@cImport` still works for now, but prefer `addTranslateC` for new code.
+
+### New Compiler/Build Flags (0.16)
+
+- `--error-style <style>` — control error message formatting (e.g., for editor integration)
+- `--multiline-errors` — emit multi-line error output
+- Unit test timeout support — guard against runaway tests in CI
+
 ### `build.zig.zon` (Package Manifest)
 ```zig
 .{
@@ -1289,22 +1610,44 @@ test_step.dependOn(&run_tests.step);
 
 ## 21. C Interoperability
 
+> **0.16 status**: `@cImport` is **deprecated**. Prefer `b.addTranslateC(...)` in `build.zig` and `@import("c")` in source. The inline form still works for now but will likely be removed in a future version.
+
+### Preferred (0.16+): Build-System Translate-C
+
+**build.zig:**
+```zig
+const translate_c = b.addTranslateC(.{
+    .root_source_file = b.path("src/c.h"),
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("c", translate_c.createModule());
+exe.linkLibC();
+exe.linkSystemLibrary("sqlite3");
+```
+
+**Source:**
+```zig
+const c = @import("c");
+const result = c.printf("Hello from C!\n");
+```
+
+### Legacy (deprecated): Inline `@cImport`
+
 ```zig
 const c = @cImport({
     @cInclude("stdio.h");
     @cInclude("math.h");
 });
 
-// Call C functions directly
 const result = c.printf("Hello from C!\n");
 const angle = c.atan2(y, x);
 
-// Link C library in build.zig
 exe.linkLibC();
 exe.linkSystemLibrary("sqlite3");
 ```
 
-Note: `@cImport` is evaluated at comptime.
+Note: `@cImport` is evaluated at comptime, but caching and cross-compilation are more deterministic via the build-system path.
 
 ---
 
@@ -1335,7 +1678,7 @@ fn threadFn() !void {
 
 ### Async / Concurrent (via `std.Io`)
 
-There are **no language-level async/await keywords**. All async is library-level on `std.Io`.
+`async` and `await` **are** language features in 0.16 (restored after being absent in 0.12–0.15). They work together with `std.Io`: the runtime that actually schedules/awaits the work is the `std.Io` implementation, while the `async`/`await` surface is part of the language. What's still gone is the 0.11-era `suspend`/`resume`/`nosuspend` frame-based system — that is NOT coming back.
 
 **`io.async`** — dispatch work, may run inline (eager execution allowed):
 ```zig
@@ -1460,7 +1803,7 @@ try batch.awaitConcurrent(io, timeout);
 6. **`@typeInfo(T).Struct`** → Use `@typeInfo(T).@"struct"`
 7. **`suspend`, `resume`, `nosuspend`, `@frameSize`** → Old 0.11-era frame-based async is gone. Use `io.async(fn, .{args})` / `future.await(io)` — async/await restored in 0.16 via `std.Io`
 8. **`std.mem.split()`** → Use `std.mem.splitSequence()` or `std.mem.splitScalar()`
-9. **`std.ArrayList(T).init(alloc)`** → Use `std.ArrayList(T) = .empty`, pass allocator per-operation
+9. **`Container(T).init(alloc)` for any std container** → Use `= .empty` and pass allocator per-operation. Applies to `ArrayList`, `AutoHashMap`, `StringHashMap`, `MultiArrayList`, `PriorityQueue`, `SinglyLinkedList`, `DoublyLinkedList`, etc. (see §1.10)
 10. **`std.os.`** → Use `std.posix.`
 11. **`std.rand.`** → Use `std.Random.`
 12. **`std.heap.page_allocator` in main** → Prefer `init.gpa` from `std.process.Init`
@@ -1469,6 +1812,29 @@ try batch.awaitConcurrent(io, timeout);
 15. **`std.io.Writer` / `std.io.Reader`** (lowercase) → Use `std.Io.Writer` / `std.Io.Reader` (capital `I`, vtable-based)
 16. **`BufferedWriter`** → Buffering is now built into `std.Io.Writer`
 17. **Old `format` signature with `comptime fmt`** → New: `fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void` — invoked via `{f}` not `{}`
+18. **`@Type(.{ .int = ... })`** → Use `@Int(.unsigned, 10)` and friends (see Section 1.14). `@Type` is gone in 0.16.
+19. **`packed union { ... }` without backing int** → Must be `packed union(u16) { ... }` in 0.16.
+20. **`@intFromFloat(@round(x))`** → Just `const y: u8 = @round(x)` — `@round`/`@floor`/`@ceil`/`@trunc` convert to int directly when destination is an int type.
+21. **`std.Thread.Mutex` / `std.Thread.ResetEvent` / `std.Thread.Condition` / `std.Thread.Semaphore`** → Moved to `std.Io.Mutex` / `std.Io.Event` / `std.Io.Condition` / `std.Io.Semaphore`
+22. **`std.once(...)`** → Removed. Restructure to avoid global lazy init, or use explicit init functions.
+23. **`std.Thread.Pool`** → Removed. Use `io.async` / `io.concurrent` / `std.Io.Group` from `std.Io`.
+24. **`std.process.Child.init(argv, gpa)` + `.spawn(io)`** → Use `std.process.spawn(io, .{ .argv = argv, ... })`
+25. **`error.RenameAcrossMountPoints` / `error.SharingViolation` / `error.EnvironmentVariableNotFound`** → Renamed to `error.CrossDevice` / `error.FileBusy` / `error.EnvironmentVariableMissing`
+26. **`@cImport` in `.zig` files** → **Deprecated in 0.16.** Use `b.addTranslateC(.{...})` in `build.zig` and `@import("c")` in source.
+27. **`std.fmt.FormatOptions`** → Renamed to `std.fmt.Options`. Also: `std.fmt.Formatter` → `std.fmt.Alt`; `std.fmt.format(w, ...)` → `std.Io.Writer.print(w, ...)`; `bufPrintZ` → `bufPrintSentinel`.
+28. **`std.Io.GenericReader` / `AnyReader` / `GenericWriter` / `AnyWriter` / `FixedBufferStream` / `CountingReader` / `null_writer`** → All removed. Use non-generic `std.Io.Reader` / `std.Io.Writer` + `std.Io.Writer.fixed` / `.Discarding` / `.Allocating`.
+29. **`std.Thread.WaitGroup` / `Futex` / `RwLock` / `Mutex.Recursive`** → Use `std.Io.Group` / `std.Io.Futex` / `std.Io.RwLock`; recursive mutex is gone (redesign).
+30. **`std.heap.ThreadSafeAllocator`** → Removed. `std.heap.ArenaAllocator` is now thread-safe + lock-free on its own; `init.gpa` is also thread-safe.
+31. **`std.process.Child.run`** → `std.process.run`. **`std.process.execv`** → `std.process.replace`. **`std.fs.selfExePath*` / `fs.openSelfExe` / `fs.Dir.setAsCwd`** → Moved to `std.process.executablePath*` / `openExecutable` / `setCurrentDir`.
+32. **`file.read(buf)` / `file.pread(...)` / `file.seekTo(...)` / `file.getEndPos()`** → `file.readStreaming(io, buf)` / `file.readPositional(io, buf, off)` / `file.reader(io, &buf).seekTo(...)` / `file.length(io)`. Similar split for writes. See §1.25.
+33. **Runtime vector indexing (`v[i]` with runtime `i`)** → Forbidden in 0.16. Convert to array first or use `@shuffle`/`@reduce`.
+34. **Pointer casts between `*[N]T` and `*@Vector(N, T)`** → No longer allowed; layouts are no longer guaranteed equivalent.
+35. **`std.SegmentedList`** → Removed. Use `std.ArrayList = .empty`, or your own chunked container if you needed stable addresses.
+36. **`std.meta.declList`** → Removed. Iterate `@typeInfo(T).@"struct".decls` directly.
+37. **Implicit `comptime` on zero-bit tuple fields** → Gone; annotate `comptime` explicitly if you need it.
+38. **Returning `&local` for a trivial local** → Compile error in 0.16 (would dangle). Return by value, or have the caller pass in a buffer.
+39. **`std.DynLib` on Windows** → Windows support removed from that API.
+40. **Assuming `std.math.sign(x)` returns `i2` or matches input type** → It now returns the smallest int type that fits; check the actual return type.
 
 ### DO generate:
 1. `std.debug.print()` for quick output — it still works with no I/O setup
@@ -1480,7 +1846,7 @@ try batch.awaitConcurrent(io, timeout);
 7. Multi-object `for` loops for parallel iteration
 8. `.{}` anonymous struct/tuple syntax
 9. `0..` open-ended ranges in for loops
-10. `io.async(fn, .{args})` / `future.await(io)` for async dispatch (library-level, not keywords)
+10. `io.async(fn, .{args})` / `future.await(io)` — `async` and `await` are real 0.16 language features, backed by `std.Io` at runtime
 11. `try io.concurrent(fn, .{args})` for guaranteed parallel execution (CPU-bound work)
 12. `std.Io.Group` / `std.Io.Select` for structured concurrency
 
@@ -1509,13 +1875,14 @@ for (points) |p| { ... }
 | 2024-09 | 0.14.0-dev.1573 | Labeled switch introduced |
 | 2025-07 | 0.15.0-dev.1092 | New `std.Io` interface (first wave); `usingnamespace` removed |
 | 2025-08 | 0.15.0-dev.1519 | ArrayList API changes |
-| 2025-08 | **0.15.1 stable** | async/await keywords removed (later restored in 0.16); `std.Io.Writer`/`Reader` vtable-based; non-generic I/O |
+| 2025-08 | **0.15.1 stable** | async/await temporarily absent (restored in 0.16 — see timeline below); `std.Io.Writer`/`Reader` vtable-based; non-generic I/O |
 | 2025-10 | **0.15.2 stable** | Latest stable release |
 | 2025-12 | 0.16.0-dev.1859 | File system I/O integrated with `std.Io` |
 | 2026-01 | 0.16.0-dev.1976 | Process API moved to `std.Io`; `main(init)` pattern |
 | 2026-01 | 0.16.0-dev.2075 | Randomness API moved to `std.Io` |
 | 2026-02 | 0.16.0-dev.2471 | `process.Child.Cwd` added |
 | 2026-03 | 0.16.0-dev.2915 | `GeneralPurposeAllocator` renamed to `DebugAllocator` |
+| 2026-04 | **0.16.0 stable** | `@Type` removed (→ `@Int`/`@Struct`/`@Union`/`@Enum`/etc.); packed union backing-int required; `@round`/`@floor`/`@ceil`/`@trunc` direct-to-int; small int→float coercion; unary float builtins (`@sqrt`/`@sin`/`@cos`/...) forward result types; **vector runtime indexing forbidden**, vector↔array in-memory coercion removed; `*T` vs `*align(1) T` distinct; `std.Thread.{Mutex,ResetEvent,Condition,Semaphore,RwLock,WaitGroup,Futex}` → `std.Io.*`; `std.once` / `Thread.Pool` / `Thread.Mutex.Recursive` / `ThreadSafeAllocator` removed; `ArenaAllocator` thread-safe/lock-free; `std.fmt.FormatOptions`→`Options`, `Formatter`→`Alt`, `fmt.format`→`Writer.print`, `bufPrintZ`→`bufPrintSentinel`; `Io.{GenericReader,AnyReader,FixedBufferStream,GenericWriter,AnyWriter,null_writer,CountingReader}` removed; `std.process.spawn`/`run`/`replace`/`executablePath*`/`openExecutable`/`setCurrentDir` consolidation; file API split into streaming vs positional, seeks moved to `Reader`, `Mode`→`Permissions`; error renames (`CrossDevice`, `FileBusy`, `EnvironmentVariableMissing`, `DirNotEmpty`); switch prongs accept packed structs & decl literals; `@cImport` **deprecated** (use `b.addTranslateC`); `std.SegmentedList` / `std.meta.declList` removed; `std.math.sign` returns smallest fitting int; `std.DynLib` Windows removed; zero-bit tuple fields no longer implicit-comptime; returning `&trivial_local` forbidden; built-in deflate (faster than zlib); maccatalyst targets added, Solaris/AIX/z/OS dropped |
 
 ---
 
@@ -1531,7 +1898,7 @@ Check what version of Zig the user is targeting. Look for:
 - `build.zig` in their project — search for a version string like `"0.16.0-dev.2471"`
 - Or ask: "What version of Zig are you using?" (`zig version`)
 
-The version this document was last updated for: **0.16.0-dev.2915** (March 2026).
+The version this document was last updated for: **0.16.0 stable** (April 2026).
 
 #### Step 2: Check Primary Sources (in priority order)
 
@@ -1637,7 +2004,8 @@ echo 'const std = @import("std"); pub fn main(init: std.process.Init) !void { va
 - **Zig Guide (0.15.2)**: https://zig.guide
 - **Zig Source (Codeberg)**: https://codeberg.org/ziglang/zig
 - **Zig Standard Library Source**: https://codeberg.org/ziglang/zig/src/branch/master/lib/std/
-- **0.15.1 Release Notes** (major breaking changes): https://ziglang.org/download/0.15.1/release-notes.html
+- **0.16.0 Release Notes** (latest stable, April 2026): https://ziglang.org/download/0.16.0/release-notes.html
+- **0.15.1 Release Notes** (prior major breaking changes): https://ziglang.org/download/0.15.1/release-notes.html
 - **Ziglings Exercises**: https://codeberg.org/ziglings/exercises
 - **Build from Source**: https://codeberg.org/ziglang/zig#building-from-source
 - **Zig Devlog**: https://ziglang.org/devlog/2026/
