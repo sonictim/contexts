@@ -3,6 +3,26 @@
 
 ---
 
+## 0. Claude Code Tool Mapping
+
+This playbook describes roles and phases abstractly. Here's how they map to actual Claude Code primitives:
+
+| Playbook Concept | Claude Code Implementation |
+|---|---|
+| Orchestrator | You (the main conversation agent) |
+| Spawn a worker | `Agent` tool — one call per worker |
+| Parallel workers | Multiple `Agent` calls in a single message |
+| Background workers | `Agent` tool with `run_in_background: true` |
+| Code-writing workers | `Agent` tool with `isolation: "worktree"` — gives each agent its own git worktree so parallel file edits don't collide |
+| External file persistence | `Write` / `Edit` tools (plan files, master documents) |
+| Context handoff to agent | The `prompt` parameter — must be self-contained since agents start cold |
+| Model selection per agent | The `model` parameter on `Agent` (`"opus"`, `"sonnet"`, `"haiku"`) |
+| Continue an existing agent | `SendMessage` with the agent's ID — resumes with full context |
+
+**Worktree rule of thumb:** Use `isolation: "worktree"` whenever a worker agent will write or edit files. Without it, two parallel agents editing the same file will race. Worktrees are automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result for you to merge.
+
+---
+
 ## 1. When to Deploy Subagents (Decision Gate)
 
 Use subagents when **at least one** of these is true:
@@ -27,9 +47,15 @@ Use subagents when **at least one** of these is true:
 
 **Do this first — before spawning any agents.**
 
-### Optional Pre-Flight: Human Scoping Gate
+### Required Pre-Flight: Human Scoping Gate
 
-Proceed autonomously if all four conditions are clearly resolved in the project brief. Pause and ask the human if any are uncertain — a wrong answer here cascades through every phase.
+**Always give a heads-up before entering a multi-agent workflow.** Subagent orchestration uses ~15x the tokens of a normal single-agent approach — that's the point (more tokens = more depth), but the human should know it's happening. Before spawning any agents:
+
+1. **Flag the approach:** Briefly explain that this task would benefit from subagents and roughly how many you plan to spawn.
+2. **Ask for a quick go-ahead:** A simple "yes, go ahead" is sufficient. Don't belabor the cost — just make sure it's not a surprise.
+3. **Mention a lighter alternative only if the task is borderline:** If the task clearly needs subagents, don't waste time offering a worse option. Only flag the trade-off when it's genuinely close.
+
+Once confirmed, resolve the following conditions. Proceed autonomously if all four are clearly resolved in the project brief. Pause and ask the human if any are uncertain — a wrong answer here cascades through every phase.
 
 | Condition | Autonomous if... | Pause and ask if... |
 |---|---|---|
@@ -171,6 +197,8 @@ TASK AGENT (Orchestrator)
 
 Grade each dimension in isolation — don't collapse all five into a single judgment. After each self-review pass, write out gap analysis before revising — identify what failed and why before making changes.
 
+**When to simplify Phase 1:** The full 5-dimension self-review loop is designed for messy, unstructured input (scraped web pages, raw research dumps, ambiguous briefs). When the source material is already well-structured — a codebase, a set of existing documents, an API with clear schema — skip the self-review loop. Have the Parse Agent do a single pass to organize the material into the working document format and move on. Don't add process overhead where the input doesn't need it.
+
 ---
 
 ### Phase 2 — Worker Agents (Parallel Execution)
@@ -298,17 +326,15 @@ Model tier directly determines first-pass output quality. Higher quality workers
 
 ---
 
-## 7. Self-Improving Tool Descriptions
+## 7. Handling Tool Failures
 
-When a tool is failing or underperforming:
+In Claude Code, tool descriptions are system-level — agents cannot rewrite them. When a tool is underperforming or failing for a specific task:
 
-1. Spawn a **tool-testing agent**
-2. Give it: the flawed tool + a sample of failure cases
-3. Agent attempts to use the tool multiple times, documents failure patterns
-4. Agent rewrites the tool description to avoid those failures
-5. Replace original description with the revised one
+1. **Document the failure pattern** — what the tool returns vs. what was expected
+2. **Add the pattern to subsequent agent briefs** — e.g., "WebSearch returns shallow results for this domain; use WebFetch on specific URLs instead"
+3. **Flag persistent failures to the human** — if a tool is fundamentally wrong for the task, say so rather than working around it silently
 
-> Anthropic found this process reduced task completion time by 40% for subsequent agents using the improved description.
+The goal is the same as Anthropic's "self-improving tool descriptions" concept — agents learn from tool failures — but adapted to the Claude Code environment where tool definitions are fixed. The knowledge travels via agent briefs, not tool rewrites.
 
 ---
 
@@ -348,24 +374,70 @@ The Critic returns a numeric score (0.0–1.0) plus categorical rating plus numb
 | MAX_LOOPS hit without excellent | No defined exit behavior | Surface document flagged with score + unresolved feedback (§4 Phase 3) |
 | First-pass worker output is weak | Under-powered model | Default workers to Opus for judgment tasks (§5) |
 | Worker failure silently skipped | No failure protocol | Retry twice, flag chunk as UNRESOLVED in master doc (§4 Phase 2) |
+| Parallel agents corrupt each other's files | Workers edit same files without isolation | Use `isolation: "worktree"` for code-writing workers (§0) |
+| Tool keeps failing across agents | Failure pattern not communicated | Document pattern in agent briefs so downstream agents avoid it (§7) |
 
 ---
 
 ## 10. Eval Checkpoints — Run These Before Shipping Any Agent System
 
+- [ ] Human given heads-up and confirmed go-ahead before spawning (§2)
 - [ ] Complexity tier assessed — worker count and MAX_LOOPS set at plan time
 - [ ] Plan written to external file before any agents spawn
 - [ ] Model tier assigned to every agent role (§5)
 - [ ] Every subagent receives a complete Agent Brief (§3)
 - [ ] Tool descriptions are specific and unambiguous
 - [ ] Workers running in parallel, not sequentially
+- [ ] Code-writing workers use `isolation: "worktree"` (§0)
 - [ ] Workers condense findings before returning — no raw output dumps
 - [ ] Worker failure protocol in place (retry twice, flag and continue)
-- [ ] Parse Agent self-review scores all five rubric dimensions before declaring structurally sound
+- [ ] Parse Agent complexity matches source material (full self-review for messy input, single pass for structured — §4 Phase 1)
 - [ ] Master Document built as external file, not in-context accumulation
 - [ ] All three quality loop exit paths defined (excellent / diminishing returns / max loops hit)
 - [ ] Non-excellent exit surfaces document flagged, not clean
+- [ ] Tool failure patterns documented in agent briefs, not silently worked around (§7)
 
 ---
 
-*Last updated: March 2026. Source: Anthropic Engineering Blog, "How we built our multi-agent research system," June 13, 2025.*
+## 11. Worked Example — Codebase Audit
+
+**Task:** "Audit the pitchfreq codebase for memory safety issues, unused allocations, and potential buffer overflows."
+
+### Phase 0: Plan (written to `_plan.md`)
+
+```markdown
+**Objective:** Produce a ranked list of memory safety concerns in ~/dev/pitchfreq, with severity, file location, and recommended fix for each.
+**Complexity:** Moderate (codebase is ~15 files, multiple concern categories)
+**Workers:** 3 (one per concern category)
+**MAX_LOOPS:** 3
+**Output schema:** Markdown table — severity (high/med/low), file:line, description, recommended fix
+```
+
+### Phase 1: Parse Agent (Sonnet)
+
+Single-pass (source is a well-structured codebase — skip self-review loop per §4 note).
+Agent reads the project structure, produces a working document listing all source files grouped by module with brief descriptions.
+
+### Phase 2: Workers (3x Opus, parallel)
+
+| Worker | Scope | NOT in scope |
+|---|---|---|
+| A — Memory safety | Use-after-free, double-free, uninitialized memory | Performance, style |
+| B — Unused allocations | Allocated-but-never-read, leaked allocators | Correctness of used allocations |
+| C — Buffer overflows | Slice bounds, unchecked indices, FFT buffer sizing | Allocation strategy |
+
+Each worker returns: condensed findings as a markdown table (severity, file:line, description, fix).
+Orchestrator merges into master document, deduplicates any overlapping findings.
+
+### Phase 3: Quality Loop
+
+- **Loop 1:** Revision Agent (Sonnet) consolidates duplicate findings, standardizes severity ratings. Critic Agent (Opus) scores 0.78 — flags that Worker C missed the resampling buffer edge case and two severity ratings seem inconsistent.
+- **Loop 2:** Revision Agent addresses feedback. Critic scores 0.92 — excellent. Exit.
+
+### Handoff
+
+Final document returned to human with score (0.92) and note: "2 loops, all categories covered, no unresolved chunks."
+
+---
+
+*Last updated: April 2026. Source: Anthropic Engineering Blog, "How we built our multi-agent research system," June 13, 2025.*

@@ -18,6 +18,9 @@ When opened, Claude should be ready to assist with any of the user's projects us
 - **ptsl.md** -- Zig/Rust FFI wrapper for Avid Pro Tools' gRPC scripting API (PTSL). Covers the architecture (Zig -> libptsl.dylib Rust layer -> Pro Tools gRPC), all 159 commands, memory model (arena allocators), and build setup.
 - **reaper.md** -- REAPER C/C++ extension plugin SDK. Covers plugin lifecycle, `plugin_register` system, action/menu/SWELL APIs, and cross-platform gotchas (especially macOS submenu insertion via `InsertMenu` + `MF_POPUP`).
 
+### Workflow & Orchestration
+- **SUBAGENT_PLAYBOOK.md** -- Multi-agent orchestration methodology: when to deploy subagents, 4-phase architecture (setup → parse → parallel workers → quality loop), agent brief templates, model selection, context management, and common failure modes. **Read this before running complex multi-agent tasks.**
+
 ### DSP Algorithm References
 - **pitch-shifting-algorithms.md** -- Implementation reference for phase vocoder, WSOLA, and hybrid time-stretch/pitch-shift algorithms. Covers FFT library choices (pffft for commercial use), phase locking, transient detection, and resampling.
 - **phase-vocoder-deep-dive.md** -- Detailed pseudocode, formulas, and complete Python reference implementation of a phase-locked vocoder with transient detection.
