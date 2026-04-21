@@ -2,7 +2,7 @@
 
 > **Purpose**: This document provides comprehensive, up-to-date context on the Zig programming language as of **Zig 0.16.0 stable** (released April 2026). Most LLMs were trained on Zig 0.11–0.13 era code, which is now significantly outdated. Use this document to avoid generating broken or deprecated Zig code.
 
-> **Sources**: [0.16.0 release notes](https://ziglang.org/download/0.16.0/release-notes.html), Ziglings exercises, Zig source repository on Codeberg, ziglang.org, zig.guide. Last updated: 2026-04-16.
+> **Sources**: [0.16.0 release notes](https://ziglang.org/download/0.16.0/release-notes.html), [Ziglings exercises](~/dev/ziglings/exercises/) (0.16-updated, excellent for interfaces/vectors/async/packed patterns), Zig source repository on Codeberg, ziglang.org, zig.guide. Last updated: 2026-04-20.
 
 ---
 
@@ -356,6 +356,42 @@ switch (u) {
     else => unreachable,
 }
 ```
+
+**Packed structs are integers in disguise.** They're useful for bitflags, binary protocol headers, and viewing the same data from different perspectives. Fields start at the least significant bit regardless of endianness. You can `@bitCast` between a packed struct and its backing integer:
+
+```zig
+// LZ4 frame descriptor FLG byte — real-world protocol header
+const FLG = packed struct(u8) {
+    dict_id: bool,
+    reserved: u1 = 0,
+    content_checksum: bool,
+    content_size: bool,
+    block_checksum: bool,
+    block_independence: bool,
+    version: u2,
+};
+
+// Convert between packed struct and backing integer
+const flg: FLG = .{ .version = 1, .block_independence = true, .content_size = true, .content_checksum = false, .dict_id = false };
+const byte: u8 = @bitCast(flg);
+const back: FLG = @bitCast(byte);
+
+// Packed unions let you view same bits from different perspectives
+const Float16 = packed union(u16) {
+    value: f16,
+    bits: packed struct(u16) {
+        mantissa: u10,
+        exponent: u5,
+        sign: u1,
+    },
+};
+
+var num: Float16 = .{ .value = 2.34 };
+num.bits.sign = 1;  // make it negative by flipping sign bit
+// num.value is now -2.34
+```
+
+Packed structs support equality comparison (`==`, `!=`) and can be used in `switch` statements (exhaustive matching on all bit patterns). They do NOT support ordering comparisons (`<`, `>`).
 
 ### 1.16 Float → Integer via `@round`/`@floor`/`@ceil`/`@trunc` (0.16 stable)
 
@@ -1179,6 +1215,42 @@ const arr: [4]i32 = v1;
 const vec: @Vector(4, i32) = arr;
 ```
 
+### Practical SIMD Patterns
+
+**Pairwise operations — replace scalar loops with vector ops:**
+```zig
+// Scalar (slow):
+fn maxPairwiseDiffScalar(a: [4]f32, b: [4]f32) f32 {
+    var max: f32 = 0;
+    for (a, b) |x, y| {
+        const d = @abs(x - y);
+        if (d > max) max = d;
+    }
+    return max;
+}
+
+// Vector (fast — compiles to SIMD instructions):
+const Vec4 = @Vector(4, f32);
+fn maxPairwiseDiffVector(a: Vec4, b: Vec4) f32 {
+    return @reduce(.Max, @abs(a - b));
+}
+```
+
+**Key operations for DSP:**
+```zig
+const v: @Vector(4, f32) = .{ 1.0, 2.0, 3.0, 4.0 };
+
+// Element-wise math (all compile to SIMD)
+const scaled = v * @as(@Vector(4, f32), @splat(0.5));  // multiply by scalar
+const sq = @sqrt(v);                                     // per-element sqrt
+const sinv = @sin(v);                                    // per-element sin
+
+// Reductions
+const sum = @reduce(.Add, v);     // horizontal sum → 10.0
+const max = @reduce(.Max, v);     // horizontal max → 4.0
+const min = @reduce(.Min, v);     // horizontal min → 1.0
+```
+
 ### 0.16 Rules (see §1.26)
 
 - **No runtime indexing of vectors.** `v[i]` with runtime `i` is a compile error. Use `@shuffle`, `@reduce`, or convert to an array first (`const a: [N]T = v;` then `a[i]`).
@@ -1382,10 +1454,16 @@ defer new_file.close(io);
 var file_reader = file.reader(io, &.{});
 const reader = &file_reader.interface;
 
+// Read into a fixed buffer (returns number of bytes actually read)
+var buf: [64]u8 = undefined;
+const bytes_read = try reader.readSliceShort(&buf);
+const content = buf[0..bytes_read];
+
 // Write to file
 var file_writer = new_file.writer(io, &.{});
 const writer = &file_writer.interface;
 try writer.print("data: {}\n", .{value});
+const bytes_written = try writer.write("raw bytes");
 
 // File metadata
 const size = try file.length(io);
@@ -1398,7 +1476,12 @@ const cwd = std.Io.Dir.cwd();
 const subdir = try cwd.openDir(io, "subdir", .{});
 defer subdir.close(io);
 
-try cwd.createDir(io, "new_dir", .{});
+// createDir takes a mode parameter — .default_dir for platform defaults
+cwd.createDir(io, "new_dir", .default_dir) catch |e| switch (e) {
+    error.PathAlreadyExists => {},  // idempotent create
+    else => return e,
+};
+
 try cwd.deleteFile(io, "temp.txt");
 try cwd.deleteTree(io, "build_output");
 ```
@@ -1776,6 +1859,68 @@ io.recancel();
 ```
 
 Every `Io` operation that can return `error.Canceled` is a "cancellation point". Use `checkCancel()` in tight loops to allow cancellation of CPU-bound work.
+
+### Queue — Bounded Thread-Safe Channel
+
+`std.Io.Queue` is the producer/consumer primitive for passing data between tasks. It's a bounded channel backed by a caller-provided buffer.
+
+```zig
+// Create a queue with space for 16 elements
+var backing: [16]u32 = undefined;
+var queue: std.Io.Queue(u32) = .init(&backing);
+
+// Producer task:
+try queue.putOne(io, value);       // blocks if queue is full
+queue.putOneUncancelable(io, v) catch return;  // can't be canceled
+
+// Consumer task:
+const val = try queue.getOne(io);  // blocks if queue is empty
+// Returns error.Closed when queue is drained and closed
+// Returns error.Canceled if task is canceled
+
+// Signal no more data:
+queue.close(io);
+```
+
+**Pattern: producer/consumer with Group:**
+```zig
+var group: std.Io.Group = .init;
+group.async(io, producer, .{ io, &queue });
+group.async(io, consumer, .{ io, &queue });
+try group.await(io);
+```
+
+Consumer drains with a `while (true)` loop, breaking on `error.Closed`:
+```zig
+fn consumer(io: std.Io, queue: *std.Io.Queue(u32)) void {
+    while (true) {
+        const value = queue.getOne(io) catch |err| switch (err) {
+            error.Closed => break,
+            error.Canceled => return,
+        };
+        // process value
+    }
+}
+```
+
+### Mutex — Protecting Shared State
+
+```zig
+var mutex: std.Io.Mutex = .init;
+
+// In a task:
+try mutex.lock(io);        // blocks until acquired; cancellation point
+defer mutex.unlock(io);    // NOTE: unlock also takes io
+// ... critical section ...
+
+// Non-blocking alternative:
+if (mutex.tryLock()) {
+    defer mutex.unlock(io);
+    // ... critical section ...
+}
+```
+
+**Important:** `mutex.lock(io)` is a cancellation point — it can return `error.Canceled`. And `mutex.unlock(io)` takes `io` as a parameter (unlike some other lock APIs).
 
 ### Batch — Low-Level Operation Batching
 ```zig
